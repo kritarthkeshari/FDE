@@ -1,0 +1,58 @@
+# One-command local stack:  docker compose up --build
+#
+# Brings up three containers on a private network:
+#   - mongo : the database (its port is NOT published, only the app needs it)
+#   - minio : local S3 (published so the browser can download files)
+#   - app   : this project, built from ./dockerfile, served on http://localhost:3000
+#
+# Data lives in named volumes, so it survives "docker compose down" (use -v to wipe).
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+
+  minio:
+    image: alpine/minio:latest-release
+    restart: unless-stopped
+    # Run as root so MinIO can write to the root-owned named volume below.
+    user: root
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API (browser downloads hit this)
+      - "9001:9001"   # MinIO web console
+    volumes:
+      - minio-data:/data
+
+  app:
+    build:
+      context: .
+      dockerfile: dockerfile
+    restart: unless-stopped
+    depends_on:
+      - mongo
+      - minio
+    environment:
+      PORT: 3000
+      # Talk to the other containers by their service name over the compose network.
+      MONGO_URI: mongodb://mongo:27017
+      DB_NAME: codetogether
+      # The app uploads/lists via the internal address...
+      S3_ENDPOINT: http://minio:9000
+      # ...but signs download URLs with the address the BROWSER can reach.
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: codetogether-uploads
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+    ports:
+      - "3000:3000"
+
+volumes:
+  mongo-data:
+  minio-data:
