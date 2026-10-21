@@ -1,0 +1,76 @@
+name: Deploy to Amazon ECS
+
+# Runs on every push to main, and can also be triggered by hand from the
+# Actions tab (workflow_dispatch).
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REPOSITORY: docker-aws/server
+  ECS_CLUSTER: silent-eagle-jnru0r
+  ECS_SERVICE: docker-aws-service-yssqbpm3
+  ECS_TASK_FAMILY: docker-aws
+  CONTAINER_NAME: Main-server
+
+jobs:
+  deploy:
+    name: Build, push, and deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Uses the two GitHub repo secrets (see README/notes).
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build from Docker-AWS/ with our Dockerfile, tag with the commit SHA
+      # (immutable, good for rollbacks) and also update :latest.
+      - name: Build and push image
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+          docker build \
+            -t "$IMAGE" \
+            -t "$REGISTRY/$ECR_REPOSITORY:latest" \
+            -f Docker-AWS/dockerfile Docker-AWS
+          docker push "$IMAGE"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # Pull the live task definition so we keep its env vars (MONGO_URI, S3_*),
+      # then swap in only the new image.
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" \
+            --query 'taskDefinition' --output json > task-definition.json
+
+      - name: Insert new image into task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build.outputs.image }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true

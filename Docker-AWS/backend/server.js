@@ -94,32 +94,42 @@ async function main() {
         ? { credentials: { accessKeyId: S3_ACCESS_KEY, secretAccessKey: S3_SECRET_KEY } }
         : {}
 
-    // Client for real operations (upload, list) against S3/MinIO.
-    const s3 = new S3Client({
-        region: S3_REGION,
-        ...(S3_ENDPOINT ? { endpoint: S3_ENDPOINT, forcePathStyle: true } : {}),
-        ...s3Credentials,
-    })
+    // File uploads need S3. If S3 is unreachable or misconfigured at startup we
+    // DISABLE uploads but keep the app running -- rooms, live editing and text
+    // persistence still work. The file routes below return 503 while disabled.
+    let filesEnabled = false
+    let s3 = null
+    let s3Presign = null
+    try {
+        // Client for real operations (upload, list) against S3/MinIO.
+        s3 = new S3Client({
+            region: S3_REGION,
+            ...(S3_ENDPOINT ? { endpoint: S3_ENDPOINT, forcePathStyle: true } : {}),
+            ...s3Credentials,
+        })
+        // Client used ONLY to sign download URLs. getSignedUrl makes no network
+        // call -- it just bakes this endpoint into the URL -- so signing with the
+        // public endpoint gives the browser a URL it can actually reach.
+        s3Presign = S3_PUBLIC_ENDPOINT
+            ? new S3Client({ region: S3_REGION, endpoint: S3_PUBLIC_ENDPOINT, forcePathStyle: true, ...s3Credentials })
+            : s3
 
-    // Client used ONLY to sign download URLs. getSignedUrl makes no network
-    // call -- it just bakes this endpoint into the URL -- so signing with the
-    // public endpoint gives the browser a URL it can actually reach. When no
-    // public endpoint is set (e.g. real AWS S3), we just reuse the main client.
-    const s3Presign = S3_PUBLIC_ENDPOINT
-        ? new S3Client({ region: S3_REGION, endpoint: S3_PUBLIC_ENDPOINT, forcePathStyle: true, ...s3Credentials })
-        : s3
+        // Make sure the bucket exists (handy for local MinIO; on AWS you'd
+        // usually create it once via the console / IaC instead).
+        await withRetry(async () => {
+            try {
+                await s3.send(new HeadBucketCommand({ Bucket: S3_BUCKET }))
+            } catch {
+                await s3.send(new CreateBucketCommand({ Bucket: S3_BUCKET }))
+                console.log(`Created S3 bucket: ${S3_BUCKET}`)
+            }
+        }, { tries: 3, label: "S3" })
 
-    // Make sure the bucket exists (handy for local MinIO; on AWS you'd usually
-    // create the bucket once via the console / IaC instead). Retried because
-    // MinIO may still be starting when the app boots.
-    await withRetry(async () => {
-        try {
-            await s3.send(new HeadBucketCommand({ Bucket: S3_BUCKET }))
-        } catch {
-            await s3.send(new CreateBucketCommand({ Bucket: S3_BUCKET }))
-            console.log(`Created S3 bucket: ${S3_BUCKET}`)
-        }
-    }, { label: "S3/MinIO" })
+        filesEnabled = true
+        console.log(`S3 ready (bucket: ${S3_BUCKET}) -- file uploads enabled`)
+    } catch (e) {
+        console.warn(`[startup] S3 unavailable -- file uploads DISABLED: ${e.message}`)
+    }
 
     // Files arrive in memory (not written to disk), then stream straight to S3.
     const upload = multer({
@@ -150,7 +160,10 @@ async function main() {
     // --- Files (scoped to a room) -------------------------------------------
     // Upload one file into a room. The bytes go to S3; a metadata record
     // (which room, S3 key, name, type, who) goes to MongoDB.
-    app.post("/api/rooms/:code/files", upload.single("file"), async (req, res) => {
+    const requireFiles = (req, res, next) =>
+        filesEnabled ? next() : res.status(503).json({ error: "File storage is not configured" })
+
+    app.post("/api/rooms/:code/files", requireFiles, upload.single("file"), async (req, res) => {
         const code = req.params.code.toUpperCase()
         if (!(await rooms.findOne({ code }))) return res.status(404).json({ error: "No such room" })
         if (!req.file) return res.status(400).json({ error: "No file, or file type not allowed" })
@@ -177,7 +190,7 @@ async function main() {
     })
 
     // List files in a room (newest first).
-    app.get("/api/rooms/:code/files", async (req, res) => {
+    app.get("/api/rooms/:code/files", requireFiles, async (req, res) => {
         const code = req.params.code.toUpperCase()
         const list = await files.find({ roomCode: code }).sort({ uploadedAt: -1 }).toArray()
         res.json(list.map((f) => ({ id: f._id, ...f })))
@@ -185,7 +198,7 @@ async function main() {
 
     // Hand back a short-lived, signed download URL for one file. The client
     // never gets our S3 credentials -- just a URL that works for 5 minutes.
-    app.get("/api/rooms/:code/files/:id/url", async (req, res) => {
+    app.get("/api/rooms/:code/files/:id/url", requireFiles, async (req, res) => {
         const code = req.params.code.toUpperCase()
         let doc
         try {
