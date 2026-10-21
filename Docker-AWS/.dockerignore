@@ -1,0 +1,10 @@
+# Never copy these into the image.
+# node_modules is reinstalled fresh inside the image:
+**/node_modules
+# secrets -- supplied at runtime via env vars, never baked in:
+backend/.env
+# rebuilt during the image build:
+frontend/dist
+**/*.log
+.git
+.gitignore
