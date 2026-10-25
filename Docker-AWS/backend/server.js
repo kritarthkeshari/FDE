@@ -215,6 +215,70 @@ async function main() {
         res.json({ url })
     })
 
+    // --- Code execution (external API: Wandbox) -----------------------------
+    // Proxy pattern: the browser calls US, we call the public Wandbox API, and
+    // we return just the program's output. The browser never talks to Wandbox
+    // directly -- same idea as our S3 routes keeping credentials server-side.
+    //
+    // (We originally targeted Piston, but its public API became whitelist-only
+    // in 2026, so we switched to Wandbox -- a keyless public runner. A real
+    // lesson in external APIs: they change their terms, and your proxy is the
+    // one place you have to update when they do.)
+    //
+    // Wandbox identifies runtimes by a specific "compiler" id, so we map the
+    // simple language name the UI sends to a known-good compiler here.
+    const WANDBOX_COMPILERS = {
+        javascript: "nodejs-20.17.0",
+        typescript: "typescript-5.6.2",
+        python: "cpython-3.13.8",
+        "c++": "gcc-13.2.0",
+        java: "openjdk-jdk-22+36",
+        go: "go-1.23.2",
+    }
+
+    app.post("/api/run", async (req, res) => {
+        const { language, code } = req.body
+        if (!language || typeof code !== "string") {
+            return res.status(400).json({ error: "language and code are required" })
+        }
+        const compiler = WANDBOX_COMPILERS[language]
+        if (!compiler) {
+            return res.status(400).json({ error: `Unsupported language: ${language}` })
+        }
+
+        try {
+            const upstream = await fetch("https://wandbox.org/api/compile.json", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ compiler, code }),
+                // Don't let a slow external call hang our request forever.
+                signal: AbortSignal.timeout(20_000),
+            })
+
+            if (!upstream.ok) {
+                // Turn their failure into a clean 502 ("bad upstream") for us.
+                const text = await upstream.text()
+                console.error("[run] Wandbox error:", upstream.status, text)
+                return res.status(502).json({ error: "Code runner unavailable" })
+            }
+
+            // Wandbox returns program_output / program_error, plus a separate
+            // compiler_error for compile-time failures. Normalise all of that
+            // into the same { stdout, stderr, exitCode } shape the UI expects,
+            // so the frontend never has to know which runner we use.
+            const r = await upstream.json()
+            res.json({
+                stdout: r.program_output ?? "",
+                stderr: [r.compiler_error, r.program_error].filter(Boolean).join("\n"),
+                exitCode: r.status != null ? Number(r.status) : null,
+            })
+        } catch (e) {
+            // Network failure, timeout, or bad JSON all land here.
+            console.error("[run] failed:", e.message)
+            res.status(502).json({ error: "Code runner unavailable" })
+        }
+    })
+
     app.get("/health", (req, res) => {
         res.status(200).json({ message: "ok", success: true })
     })

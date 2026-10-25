@@ -11,6 +11,17 @@ function formatSize(bytes) {
   return (bytes / 1024 / 1024).toFixed(1) + " MB"
 }
 
+// Languages the Run button offers. `monaco` is the editor's syntax id; `piston`
+// is the name the Piston API expects -- they differ (e.g. cpp vs c++).
+const LANGUAGES = [
+  { label: "JavaScript", monaco: "javascript", piston: "javascript" },
+  { label: "Python",     monaco: "python",     piston: "python" },
+  { label: "TypeScript", monaco: "typescript", piston: "typescript" },
+  { label: "Java",       monaco: "java",       piston: "java" },
+  { label: "C++",        monaco: "cpp",        piston: "c++" },
+  { label: "Go",         monaco: "go",         piston: "go" },
+]
+
 function App() {
 
   const editorRef = useRef(null)
@@ -26,6 +37,11 @@ function App() {
   const [ files, setFiles ] = useState([])
   const [ uploading, setUploading ] = useState(false)
   const [ fileError, setFileError ] = useState("")
+
+  // Code-runner state. `language` holds the Piston name of the chosen language.
+  const [ language, setLanguage ] = useState("javascript")
+  const [ output, setOutput ] = useState(null)   // { stdout, stderr, exitCode } | null
+  const [ running, setRunning ] = useState(false)
 
   // Lobby-only form state.
   const [ name, setName ] = useState("")
@@ -133,6 +149,31 @@ function App() {
       window.open(url, "_blank", "noopener")
     } catch { /* ignore */ }
   }
+
+
+  // --- Run code -------------------------------------------------------------
+  // Send the editor's current text to OUR backend, which proxies it to Piston.
+  const handleRun = async () => {
+    const code = editorRef.current?.getValue() ?? ""
+    setRunning(true)
+    setOutput(null)
+    try {
+      const res = await fetch("/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ language, code }),
+      })
+      const data = await res.json().catch(() => ({}))
+      setOutput(res.ok ? data : { stderr: data.error || "Run failed" })
+    } catch {
+      setOutput({ stderr: "Could not reach the server" })
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  // Monaco's syntax id for the selected language (falls back to plaintext).
+  const monacoLang = LANGUAGES.find((l) => l.piston === language)?.monaco ?? "javascript"
 
 
   useEffect(() => {
@@ -288,14 +329,49 @@ function App() {
         </div>
       </aside>
 
-      <section className="w-3/4 bg-neutral-800 rounded-lg overflow-hidden">
-        <Editor
-          height="100%"
-          defaultLanguage="javascript"
-          defaultValue="// some comment"
-          theme="vs-dark"
-          onMount={handleMount}
-        />
+      <section className="w-3/4 bg-neutral-800 rounded-lg overflow-hidden flex flex-col">
+        {/* Toolbar: pick a language and run the shared code. */}
+        <div className="flex items-center gap-2 p-2 border-b border-neutral-700">
+          <select
+            value={language}
+            onChange={(e) => setLanguage(e.target.value)}
+            className="bg-neutral-700 text-white text-sm rounded px-2 py-1 outline-none"
+          >
+            {LANGUAGES.map((l) => (
+              <option key={l.piston} value={l.piston}>{l.label}</option>
+            ))}
+          </select>
+          <button
+            onClick={handleRun}
+            disabled={running}
+            className="px-4 py-1 rounded bg-green-500 text-gray-950 text-sm font-bold disabled:opacity-50"
+          >
+            {running ? "Running…" : "▶ Run"}
+          </button>
+        </div>
+
+        <div className="flex-1 min-h-0">
+          <Editor
+            height="100%"
+            language={monacoLang}
+            defaultValue="// some comment"
+            theme="vs-dark"
+            onMount={handleMount}
+          />
+        </div>
+
+        {/* Output panel: only shown once there's a result to show. */}
+        {output && (
+          <div className="h-1/3 overflow-y-auto border-t border-neutral-700 p-3 font-mono text-sm">
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-gray-400 text-xs uppercase tracking-wide">Output</span>
+              <button onClick={() => setOutput(null)} className="text-gray-500 text-xs hover:text-white">clear</button>
+            </div>
+            {output.stdout && <pre className="text-green-300 whitespace-pre-wrap">{output.stdout}</pre>}
+            {output.stderr && <pre className="text-red-400 whitespace-pre-wrap">{output.stderr}</pre>}
+            {!output.stdout && !output.stderr && <pre className="text-gray-500">(no output)</pre>}
+          </div>
+        )}
       </section>
     </main>
   )
